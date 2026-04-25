@@ -1,0 +1,114 @@
+# Changelog
+
+## 3.8.0 - 2026-03-26
+
+### Added (2)
+
+- Added `py.typed` file to indicate that the package supports type hints.
+- Added clear cache option to `Signer` class to allow clearing cached signatures.
+
+### Updated (4)
+
+- Fix bug with exposing secrets on messages logging.
+- Updated `print` statement to be logged instead of printed.
+- Updated mutable default parameter to avoid shared state between instances.
+- Updated `tox.ini` file
+
+## 3.7.0 - 2026-03-16
+
+### Added (1)
+
+- Added `serverShutdown` event handler.
+
+## 3.6.0 - 2026-02-11
+
+### Updated (2)
+
+- Updated `ws_api_payload` function to include the `id` sent in the payload.
+- Updated `pyproject.toml` dependencies
+
+## 3.5.0 - 2026-01-29
+
+### Updated (1)
+
+- Fixed `WebsocketStream` method `Subscribe` when sending multiple streams in a single request.
+
+## 3.4.1 - 2026-01-23
+
+### Added (1)
+
+- Added `Alpha` base url
+
+## 3.4.0 - 2026-01-13
+
+### Changed (1)
+
+- Support Derivatives Trading Options different WS Streams URL paths.
+
+## 3.3.0 - 2025-12-22
+
+### Changed (6)
+
+- Added `body` parameter to `send_request` function for Rest API http requests.
+- Added `return_rate_limits` parameter to `ConfigurationWebSocketAPI` to avoid receiving rate limit headers.
+- Added `id_strict_int` parameter to `WebSocketStreamBase` to fix `Derivatives Trading Options` error.
+- Updated returned error value in `send_request` function.
+- Updated Websocket `timeout` and `reconnect_delay` to be in milliseconds.
+- Updated `backoff` to be in milliseconds.
+
+## 3.2.0 - 2025-10-10
+
+### Changed (1)
+
+- Fixed issue with response model deserialization in `send_request` function in `utils.py`.
+
+## 3.1.1 - 2025-09-16
+
+### Changed (1)
+
+- Fixed missing enum check in `clean_none_value`.
+
+## 3.1.0 - 2025-09-12
+
+### Changed (3)
+
+- Updated WebsocketStream user data stream response handler
+- Updated Encoded request matrix handler
+- Fix decimal type in request parameters
+
+## 3.0.0 - 2025-09-05
+
+### Added (2)
+
+- Support automatic session re-logon on reconncetions/renewals when session is already logged on (`Session re-logon` option on `WebSocketAPIBase`).
+- Added the `api_key` parameter to include `apiKey` in WebsocketAPI request parameters.
+
+### Changed (2)
+
+- Fixed return type mismatch by returning the raw value.
+- Updated `WebsocketAPI` user data return value to match its type.
+
+## 2.0.0 - 2025-08-22
+
+### Changed (3)
+
+- Added custom REST headers
+- Added `subscribe_user_data`, `on` and `unsubscribe` method to `WebSocketAPIBase`
+- Updated `RequestStream` response type to `RequestStreamHandle`
+
+## 1.2.0 - 2025-08-07
+
+### Changed (1)
+
+- Fixed empty array response handling in `utils.py`.
+
+## 1.1.0 - 2025-08-06
+
+### Changed (2)
+
+- Updated `list_subscribe` method `json_msg` format and response.
+- Added Enum serialization in `utils.py` to handle Enum values.
+
+## 1.0.0 - 2025-01-16
+
+First release
