@@ -57,16 +57,21 @@ class DerivativesTradingUsdsFuturesWebSocketStreams(WebSocketStreamBase):
         streams,
         response_model: Optional[T] = None,
         stream_url: Optional[str] = None,
+        callback: Optional[Callable[[T], None]] = None,
     ):
         """Subscribes to the specified WebSocket streams.
 
         Args:
             streams (list): A list of WebSocket streams to subscribe to.
             response_model (Optional[T]): The Pydantic model to validate the response against.
+            callback (Optional[Callable[[T], None]]): Callback seeded before the SUBSCRIBE frame is sent.
         """
 
         await super().subscribe(
-            streams, response_model=response_model, stream_url=stream_url
+            streams,
+            response_model=response_model,
+            stream_url=stream_url,
+            callback=callback,
         )
 
     async def unsubscribe(self, streams):

@@ -5,6 +5,7 @@ import logging
 
 from pydantic import BaseModel
 from typing import Callable, Optional, Dict, Generic, Union, TypeVar, Type
+from urllib.parse import urlsplit, urlunsplit
 
 from binance_common.configuration import (
     ConfigurationWebSocketAPI,
@@ -69,9 +70,11 @@ class WebSocketConnection:
         self.ws_type = ws_type
         self.websocket = websocket
         self.reconnect = False
+        self.close_initiated = False
         self.is_session_log_on = False
         self.session_logon_request = None
         self.url_path = url_path
+        self.scheduled_reconnect_task = None
 
 
 class WebSocketCommon:
@@ -159,7 +162,7 @@ class WebSocketCommon:
         logging.info(f"Connecting to {url} with proxy {proxy}")
 
         if url_path:
-            url = url.replace("/stream", f"/{url_path}/stream")
+            url = self._stream_url_for_route(url, url_path)
 
         if type(configuration).__name__ == "ConfigurationWebSocketAPI":
             websocket = await self.session.ws_connect(
@@ -197,10 +200,60 @@ class WebSocketCommon:
 
         self.connections.append(connection)
 
-        asyncio.create_task(
+        connection.scheduled_reconnect_task = asyncio.create_task(
             self.schedule_reconnect(connection, configuration, 23 * 3600)
         )
         asyncio.create_task(self.receive_loop(connection))
+
+    @staticmethod
+    def _stream_url_for_route(url: str, url_path: str) -> str:
+        parsed = urlsplit(url)
+        routes = {"public", "market", "private"}
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if path_parts and path_parts[-1] in {"stream", "ws"}:
+            path_parts = path_parts[:-1]
+        if path_parts and path_parts[-1] in routes | {"ws"}:
+            path_parts = path_parts[:-1]
+
+        # TODO(binance-sdk-migration): normalize legacy futures /ws or /stream
+        # inputs onto Binance's routed /public|/market|/private/stream entries.
+        path_parts.extend([url_path, "stream"])
+        path = "/" + "/".join(path_parts)
+        return urlunsplit(
+            (parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment)
+        )
+
+    def _emit_websocket_closed(self, connection: WebSocketConnection, reason: str):
+        if (
+            getattr(connection, "close_initiated", False)
+            or connection.reconnect
+            or getattr(self, "close_initiated", False)
+        ):
+            return
+
+        callbacks = connection.stream_callback_map.get("WebSocketclosed") or []
+        if not callbacks:
+            return
+
+        # TODO(binance-sdk-migration): expose routed close events so callers can
+        # reconnect the exact /public, /market, or /private stream instead of
+        # failing silently on Binance's post-2026-04-23 websocket split.
+        payload = {
+            "stream": "WebSocketclosed",
+            "data": {
+                "StopAsyncIteration": reason,
+                "urlPath": connection.url_path,
+                "connectionId": connection.id,
+            },
+        }
+        for callback in callbacks:
+            try:
+                callback(payload)
+            except Exception as exc:
+                logging.error(
+                    f"Error in WebSocketclosed callback for {connection.id}: {exc}",
+                    exc_info=True,
+                )
 
     async def receive_loop(self, connection: WebSocketConnection):
         """Continuously receive messages from the WebSocket server.
@@ -208,110 +261,149 @@ class WebSocketCommon:
         Args:
             connection (WebSocketConnection): WebSocket connection object.
         """
+        close_reason = "websocket receive loop ended"
+        try:
+            async for msg in connection.websocket:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
 
-        async for msg in connection.websocket:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                data = json.loads(msg.data)
-
-                request_id = data.get("id")
-                if request_id and request_id in connection.pending_request:
-                    future = connection.pending_request.pop(request_id)
-                    if data.get("error"):
-                        future.set_exception(
-                            ValueError(f"Error received from server: {data['error']}")
-                        )
-                    else:
-                        future.set_result(data)
-                elif (
-                    data.get("event", {}).get("e") == "serverShutdown"
-                    and not connection.reconnect
-                    and connection.id not in self.reconnect_tasks
-                    and not getattr(self, "close_initiated", False)
-                ):
-                    logging.warning(
-                        "Server shutdown event received, scheduling reconnect"
-                    )
-                    await self.schedule_reconnect(
-                        connection, self.configuration, 5, close_old_connection=False
-                    )
-                    await self.close_connection(connection, False)
-                    self.reconnect_tasks.remove(connection.id)
-                else:
-                    if data.get("error"):
-                        raise ValueError(f"Error received from server: {data['error']}")
-
-                    stream = data.get("stream")
-                    subscription_id = data.get("subscriptionId")
-
-                    key = stream or subscription_id
-                    callbacks = (
-                        connection.stream_callback_map.get(key)
-                        if key is not None
-                        else None
-                    )
-
-                    if callbacks:
-                        try:
-                            if stream:
-                                response_model = connection.response_types.get(stream)
-                                payload = data["data"] if response_model else data
-
-                                for callback in callbacks:
-                                    if response_model:
-                                        if response_model.__pydantic_fields__.get(
-                                            "one_of_schemas"
-                                        ):
-                                            parsed = payload
-                                        elif isinstance(payload, list):
-                                            parsed = [
-                                                response_model.model_validate_json(
-                                                    json.dumps(item)
-                                                )
-                                                for item in payload
-                                            ]
-                                        else:
-                                            parsed = response_model.model_validate_json(
-                                                json.dumps(payload)
-                                            )
-                                        callback(parsed)
-                                    else:
-                                        callback(payload)
-                            else:
-                                response_model = connection.response_types.get(
-                                    subscription_id
+                    request_id = data.get("id")
+                    if request_id and request_id in connection.pending_request:
+                        future = connection.pending_request.pop(request_id)
+                        if data.get("error") or (
+                            data.get("code") is not None and data.get("msg")
+                        ):
+                            future.set_exception(
+                                ValueError(
+                                    "Error received from server: "
+                                    f"{data.get('error') or data}"
                                 )
-                                payload = data["event"]
-
-                                for callback in callbacks:
-                                    if response_model:
-                                        if isinstance(payload, list):
-                                            parsed = [
-                                                parse_user_event(item, response_model)
-                                                for item in payload
-                                            ]
-                                        else:
-                                            parsed = parse_user_event(
-                                                payload, response_model
-                                            )
-                                        callback(parsed)
-                                    else:
-                                        callback(payload)
-                        except Exception as e:
-                            raise ValueError(f"Error in callback for key {key}: {e}")
+                            )
+                        else:
+                            future.set_result(data)
+                    elif (
+                        data.get("event", {}).get("e") == "serverShutdown"
+                        and not connection.reconnect
+                        and connection.id not in self.reconnect_tasks
+                        and not connection.close_initiated
+                        and not getattr(self, "close_initiated", False)
+                    ):
+                        logging.warning(
+                            "Server shutdown event received, scheduling reconnect"
+                        )
+                        await self.schedule_reconnect(
+                            connection,
+                            self.configuration,
+                            5,
+                            close_old_connection=False,
+                        )
+                        await self.close_connection(connection, False)
+                        if connection.id in self.reconnect_tasks:
+                            self.reconnect_tasks.remove(connection.id)
                     else:
-                        logging.info(f"Received message: {data}")
-            elif msg.type == aiohttp.WSMsgType.PING:
-                logging.info("Received PING from server")
-                await connection.websocket.pong()
-            elif msg.type == aiohttp.WSMsgType.PONG:
-                logging.info("Received PONG from server")
-            elif msg.type == aiohttp.WSMsgType.ERROR:
-                logging.error("Received error from server")
-                logging.error(connection.websocket.exception())
-                break
-            elif msg.type == aiohttp.WSMsgType.CLOSE:
-                logging.info("WebSocket closed")
-                break
+                        if data.get("error") or (
+                            data.get("code") is not None and data.get("msg")
+                        ):
+                            raise ValueError(
+                                "Error received from server: "
+                                f"{data.get('error') or data}"
+                            )
+
+                        stream = data.get("stream")
+                        subscription_id = data.get("subscriptionId")
+
+                        key = stream or subscription_id
+                        callbacks = (
+                            connection.stream_callback_map.get(key)
+                            if key is not None
+                            else None
+                        )
+
+                        if callbacks:
+                            try:
+                                if stream:
+                                    response_model = connection.response_types.get(
+                                        stream
+                                    )
+                                    payload = data["data"] if response_model else data
+
+                                    for callback in callbacks:
+                                        if response_model:
+                                            if response_model.__pydantic_fields__.get(
+                                                "one_of_schemas"
+                                            ):
+                                                parsed = payload
+                                            elif isinstance(payload, list):
+                                                parsed = [
+                                                    response_model.model_validate_json(
+                                                        json.dumps(item)
+                                                    )
+                                                    for item in payload
+                                                ]
+                                            else:
+                                                parsed = (
+                                                    response_model.model_validate_json(
+                                                        json.dumps(payload)
+                                                    )
+                                                )
+                                            callback(parsed)
+                                        else:
+                                            callback(payload)
+                                else:
+                                    response_model = connection.response_types.get(
+                                        subscription_id
+                                    )
+                                    payload = data["event"]
+
+                                    for callback in callbacks:
+                                        if response_model:
+                                            if isinstance(payload, list):
+                                                parsed = [
+                                                    parse_user_event(
+                                                        item, response_model
+                                                    )
+                                                    for item in payload
+                                                ]
+                                            else:
+                                                parsed = parse_user_event(
+                                                    payload, response_model
+                                                )
+                                            callback(parsed)
+                                        else:
+                                            callback(payload)
+                            except Exception as e:
+                                raise ValueError(
+                                    f"Error in callback for key {key}: {e}"
+                                )
+                        else:
+                            logging.info(f"Received message: {data}")
+                elif msg.type == aiohttp.WSMsgType.PING:
+                    logging.info("Received PING from server")
+                    # TODO(binance-sdk-migration): Binance requires pong frames to
+                    # copy the server ping payload on futures market streams and
+                    # websocket API connections.
+                    await connection.websocket.pong(getattr(msg, "data", None))
+                elif msg.type == aiohttp.WSMsgType.PONG:
+                    logging.info("Received PONG from server")
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    websocket_error = connection.websocket.exception()
+                    close_reason = f"websocket error: {websocket_error}"
+                    logging.error("Received error from server")
+                    logging.error(websocket_error)
+                    break
+                elif msg.type == aiohttp.WSMsgType.CLOSE:
+                    close_reason = "websocket close frame received"
+                    logging.info("WebSocket closed")
+                    break
+        except asyncio.CancelledError:
+            close_reason = None
+            raise
+        except Exception as exc:
+            close_reason = f"websocket receive loop exception: {exc}"
+            logging.error(close_reason, exc_info=True)
+        finally:
+            if close_reason:
+                self._emit_websocket_closed(connection, close_reason)
 
     async def send_message(
         self,
@@ -351,6 +443,7 @@ class WebSocketCommon:
             logging.info(f"Ping sent to WebSocket {connection.id}")
         except Exception as e:
             logging.error(f"Error sending ping to WebSocket {connection.id}: {e}")
+            raise
 
     async def schedule_reconnect(
         self,
@@ -370,6 +463,9 @@ class WebSocketCommon:
 
         await asyncio.sleep(delay)
 
+        if connection.close_initiated or getattr(self, "close_initiated", False):
+            return
+
         if close_old_connection:
             connection.reconnect = True
 
@@ -385,8 +481,27 @@ class WebSocketCommon:
             )
             await asyncio.sleep(1)
             connection.is_session_log_on = False
-        self.reconnect_tasks.append(connection.id)
-        await self.reconnect(connection, configuration, close_old_connection)
+        if connection.id not in self.reconnect_tasks:
+            self.reconnect_tasks.append(connection.id)
+        try:
+            await self.reconnect(connection, configuration, close_old_connection)
+        finally:
+            if (
+                getattr(connection, "scheduled_reconnect_task", None)
+                is asyncio.current_task()
+            ):
+                connection.scheduled_reconnect_task = None
+
+    def _cancel_scheduled_reconnect(self, connection: WebSocketConnection):
+        task = getattr(connection, "scheduled_reconnect_task", None)
+        if not task:
+            return
+
+        if task is not asyncio.current_task() and not task.done():
+            task.cancel()
+
+        if task is not asyncio.current_task():
+            connection.scheduled_reconnect_task = None
 
     async def reconnect(
         self,
@@ -405,33 +520,51 @@ class WebSocketCommon:
         if len(connection.pending_request) > 0:
             connection.pending_request.clear()
 
-        if close_old_connection:
-            await self.close_connection(connection, False)
-        if configuration.reconnect_delay:
-            await asyncio.sleep(configuration.reconnect_delay / 1000)
+        try:
+            if close_old_connection:
+                await self.close_connection(connection, False)
+            if configuration.reconnect_delay:
+                await asyncio.sleep(configuration.reconnect_delay / 1000)
 
-        await self.connect(configuration.stream_url, configuration, connection.id)
+            if self.session is None:
+                self.session = aiohttp.ClientSession()
 
-        new_connection = next(
-            (c for c in self.connections if c.id == connection.id), None
-        )
-        if not new_connection:
-            logging.error("Reconnect failed: new connection not found")
-            return
-
-        if connection.session_logon_request and self.configuration.session_re_logon:
-            await self.session_re_log_on(
-                connection.session_logon_request, new_connection
+            # TODO(binance-sdk-migration): reconnect a routed stream onto the same
+            # Binance /public, /market, or /private entry it originally used.
+            await self.init_connection(
+                configuration.stream_url,
+                configuration,
+                url_path=connection.url_path,
+                ws_id=connection.id,
             )
-            await asyncio.sleep(1)
-            await self._resubscribe_user_streams(connection, new_connection)
 
-        await self._resubscribe_global_streams(connection, new_connection)
-        logging.info(f"Reconnected WebSocket {close_old_connection}")
+            new_connection = next(
+                (
+                    c
+                    for c in reversed(self.connections)
+                    if c.id == connection.id and c is not connection
+                ),
+                None,
+            )
+            if not new_connection:
+                logging.error("Reconnect failed: new connection not found")
+                return
 
-        if close_old_connection:
-            self.reconnect_tasks.remove(connection.id)
-            connection.reconnect = False
+            if connection.session_logon_request and self.configuration.session_re_logon:
+                await self.session_re_log_on(
+                    connection.session_logon_request, new_connection
+                )
+                await asyncio.sleep(1)
+                await self._resubscribe_user_streams(connection, new_connection)
+
+            await self._resubscribe_global_streams(connection, new_connection)
+            self._copy_internal_stream_callbacks(connection, new_connection)
+            logging.info(f"Reconnected WebSocket {close_old_connection}")
+        finally:
+            if close_old_connection:
+                if connection.id in self.reconnect_tasks:
+                    self.reconnect_tasks.remove(connection.id)
+                connection.reconnect = False
 
     async def _resubscribe_user_streams(
         self, old_connection: WebSocketConnection, new_connection: WebSocketConnection
@@ -460,6 +593,13 @@ class WebSocketCommon:
             new_connection.response_types[stream] = old_connection.response_types.get(
                 stream
             )
+
+    def _copy_internal_stream_callbacks(
+        self, old_connection: WebSocketConnection, new_connection: WebSocketConnection
+    ):
+        callbacks = old_connection.stream_callback_map.get("WebSocketclosed")
+        if callbacks:
+            new_connection.stream_callback_map["WebSocketclosed"] = callbacks
 
     async def _resubscribe_global_streams(
         self, old_connection: WebSocketConnection, new_connection: WebSocketConnection
@@ -536,6 +676,7 @@ class WebSocketCommon:
             logging.warning("No WebSocket connections to close.")
         elif connection:
             try:
+                self._cancel_scheduled_reconnect(connection)
                 connection.close_initiated = True
                 await connection.websocket.close()
                 logging.info(f"WebSocket {connection.id} closed.")
@@ -545,6 +686,7 @@ class WebSocketCommon:
         else:
             for connection in self.connections[:]:
                 try:
+                    self._cancel_scheduled_reconnect(connection)
                     connection.close_initiated = True
                     await connection.websocket.close()
                     logging.info(f"WebSocket {connection.id} closed.")
@@ -590,11 +732,66 @@ class WebSocketStreamBase(WebSocketCommon):
             self.configuration.stream_url, self.configuration, url_paths=self.url_paths
         )
 
+    @staticmethod
+    def _expected_usds_futures_route(stream: str) -> Optional[str]:
+        stream_name = stream.lower()
+        parts = stream_name.split("@")
+        event_name = parts[1] if len(parts) > 1 else stream_name
+
+        if stream_name == "!bookticker" or event_name.startswith(
+            ("bookticker", "depth", "rpidepth")
+        ):
+            return "public"
+
+        if stream_name.startswith(
+            (
+                "!markprice",
+                "!ticker",
+                "!miniticker",
+                "!forceorder",
+                "!contractinfo",
+                "!compositeindex",
+                "!assetindex",
+            )
+        ) or event_name.startswith(
+            (
+                "aggtrade",
+                "markprice",
+                "kline",
+                "ticker",
+                "miniticker",
+                "forceorder",
+                "contractinfo",
+                "compositeindex",
+                "indexprice",
+                "continuouskline",
+                "assetindex",
+            )
+        ):
+            return "market"
+
+        return None
+
+    def _validate_stream_route(self, streams: list[str], stream_url: Optional[str]):
+        if not stream_url:
+            return
+
+        for stream in streams:
+            expected_route = self._expected_usds_futures_route(stream)
+            if expected_route and expected_route != stream_url:
+                # TODO(binance-sdk-migration): fail fast when a futures stream is
+                # sent to the wrong /public, /market, or /private route.
+                raise ValueError(
+                    f"Stream {stream} belongs to /{expected_route}, "
+                    f"not /{stream_url}"
+                )
+
     async def subscribe(
         self,
         streams: list[str],
         response_model: Optional[Type[T]] = None,
         stream_url: Optional[str] = None,
+        callback: Optional[Callable[[T], None]] = None,
     ):
         """Subscribe to a list of streams.
 
@@ -609,6 +806,8 @@ class WebSocketStreamBase(WebSocketCommon):
         if isinstance(streams, str):
             streams = [streams]
 
+        self._validate_stream_route(streams, stream_url)
+
         if len(self.connections) == 0 and len(self.reconnect_tasks) == 0:
             await self.close_connection(close_session=True)
             raise ValueError("No WebSocket connections available.")
@@ -617,11 +816,42 @@ class WebSocketStreamBase(WebSocketCommon):
             logging.warning("No available WebSocket connections for subscription.")
             return
 
-        streams = [
-            stream
-            for stream in streams
-            if stream not in global_stream_connections.stream_connections_map
-        ]
+        filtered_streams = []
+        for stream in streams:
+            existing_connection = global_stream_connections.stream_connections_map.get(
+                stream
+            )
+            if existing_connection is None:
+                filtered_streams.append(stream)
+                continue
+
+            existing_websocket = getattr(existing_connection, "websocket", None)
+            if getattr(existing_websocket, "closed", False):
+                # TODO(binance-sdk-migration): stale routed registrations must not
+                # make a new /public, /market, or /private subscribe silently no-op.
+                global_stream_connections.stream_connections_map.pop(stream, None)
+                existing_connection.stream_callback_map.pop(stream, None)
+                existing_connection.response_types.pop(stream, None)
+                filtered_streams.append(stream)
+                continue
+
+            existing_route = getattr(existing_connection, "url_path", None)
+            if stream_url and existing_route != stream_url:
+                # TODO(binance-sdk-migration): fail fast if a stream is already
+                # bound to a different Binance routed websocket entry.
+                raise ValueError(
+                    f"Stream {stream} is already registered on /{existing_route}, "
+                    f"not /{stream_url}"
+                )
+            if callback:
+                callbacks = existing_connection.stream_callback_map.setdefault(
+                    stream, []
+                )
+                if callback not in callbacks:
+                    callbacks.append(callback)
+                existing_connection.response_types[stream] = response_model
+
+        streams = filtered_streams
 
         for stream in streams:
             if stream_url:
@@ -642,7 +872,12 @@ class WebSocketStreamBase(WebSocketCommon):
                 )
 
             if connection is None:
-                logging.warning(f"No matching connection found for stream: {stream}")
+                message = f"No matching connection found for stream: {stream}"
+                if stream_url:
+                    # TODO(binance-sdk-migration): an explicit Binance route with no
+                    # matching connection is a hard setup failure, not a warning.
+                    raise ValueError(f"{message} on /{stream_url}")
+                logging.warning(message)
                 continue
 
             logging.info(f"Subscribing to streams: {streams}")
@@ -651,11 +886,24 @@ class WebSocketStreamBase(WebSocketCommon):
                 "params": [stream],
                 "id": get_random_int() if self.id_strict_int else get_uuid(),
             }
-            await asyncio.sleep(0.5)
-            await self.send_message(json_msg, connection)
             global_stream_connections.stream_connections_map[stream] = connection
-            connection.stream_callback_map.update({stream: []})
-            connection.response_types.update({stream: response_model})
+            # TODO(binance-sdk-migration): seed callbacks before SUBSCRIBE is sent.
+            # Binance can push the first trade immediately after accepting a live
+            # subscription, before subscribe() returns to the caller for on().
+            connection.stream_callback_map[stream] = [callback] if callback else []
+            connection.response_types[stream] = response_model
+            try:
+                await asyncio.sleep(0.5)
+                await self.send_message(json_msg, connection)
+            except Exception:
+                if (
+                    global_stream_connections.stream_connections_map.get(stream)
+                    is connection
+                ):
+                    global_stream_connections.stream_connections_map.pop(stream, None)
+                connection.stream_callback_map.pop(stream, None)
+                connection.response_types.pop(stream, None)
+                raise
 
     def on(self, event: str, callback: Callable[[T], None], stream: str) -> None:
         """Set the callback function for incoming messages on a specific stream.
