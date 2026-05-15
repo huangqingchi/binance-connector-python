@@ -200,9 +200,13 @@ class WebSocketCommon:
 
         self.connections.append(connection)
 
-        connection.scheduled_reconnect_task = asyncio.create_task(
-            self.schedule_reconnect(connection, configuration, 23 * 3600)
-        )
+        # TODO(asymmetrictrader): Do not enable the SDK's default 23h reconnect.
+        # Public and private stream lifecycles are supervised by the application
+        # health checks. The SDK timer can race that supervisor, close otherwise
+        # healthy routed sockets, and replay hundreds of subscriptions one by one.
+        # connection.scheduled_reconnect_task = asyncio.create_task(
+        #     self.schedule_reconnect(connection, configuration, 23 * 3600)
+        # )
         asyncio.create_task(self.receive_loop(connection))
 
     @staticmethod
@@ -440,7 +444,7 @@ class WebSocketCommon:
         websocket = connection.websocket
         try:
             await websocket.ping()
-            logging.info(f"Ping sent to WebSocket {connection.id}")
+            logging.debug(f"Ping sent to WebSocket {connection.id}")
         except Exception as e:
             logging.error(f"Error sending ping to WebSocket {connection.id}: {e}")
             raise
@@ -853,6 +857,7 @@ class WebSocketStreamBase(WebSocketCommon):
 
         streams = filtered_streams
 
+        subscriptions_by_connection: dict[WebSocketConnection, list[str]] = {}
         for stream in streams:
             if stream_url:
                 candidates = [c for c in self.connections if c.url_path == stream_url]
@@ -880,29 +885,32 @@ class WebSocketStreamBase(WebSocketCommon):
                 logging.warning(message)
                 continue
 
-            logging.info(f"Subscribing to streams: {streams}")
-            json_msg = {
-                "method": "SUBSCRIBE",
-                "params": [stream],
-                "id": get_random_int() if self.id_strict_int else get_uuid(),
-            }
             global_stream_connections.stream_connections_map[stream] = connection
             # TODO(binance-sdk-migration): seed callbacks before SUBSCRIBE is sent.
             # Binance can push the first trade immediately after accepting a live
             # subscription, before subscribe() returns to the caller for on().
             connection.stream_callback_map[stream] = [callback] if callback else []
             connection.response_types[stream] = response_model
+            subscriptions_by_connection.setdefault(connection, []).append(stream)
+
+        for connection, connection_streams in subscriptions_by_connection.items():
+            logging.info(f"Subscribing to streams: {connection_streams}")
+            json_msg = {
+                "method": "SUBSCRIBE",
+                "params": connection_streams,
+                "id": get_random_int() if self.id_strict_int else get_uuid(),
+            }
             try:
-                await asyncio.sleep(0.5)
                 await self.send_message(json_msg, connection)
             except Exception:
-                if (
-                    global_stream_connections.stream_connections_map.get(stream)
-                    is connection
-                ):
-                    global_stream_connections.stream_connections_map.pop(stream, None)
-                connection.stream_callback_map.pop(stream, None)
-                connection.response_types.pop(stream, None)
+                for stream in connection_streams:
+                    if (
+                        global_stream_connections.stream_connections_map.get(stream)
+                        is connection
+                    ):
+                        global_stream_connections.stream_connections_map.pop(stream, None)
+                    connection.stream_callback_map.pop(stream, None)
+                    connection.response_types.pop(stream, None)
                 raise
 
     def on(self, event: str, callback: Callable[[T], None], stream: str) -> None:

@@ -879,6 +879,27 @@ class TestWebSocketStreamBase:
         assert mock_connection.stream_callback_map["test_stream"] == [callback]
 
     @pytest.mark.asyncio
+    async def test_subscribe_sends_streams_in_one_batch(
+        self, websocket_stream, mock_connection, mock_registry
+    ):
+        def callback(x):
+            return x
+
+        await websocket_stream.subscribe(
+            ["btcusdt@aggTrade", "ethusdt@aggTrade"],
+            callback=callback,
+        )
+
+        mock_connection.websocket.send_str.assert_awaited_once()
+        payload = json.loads(mock_connection.websocket.send_str.await_args.args[0])
+        assert payload["method"] == "SUBSCRIBE"
+        assert payload["params"] == ["btcusdt@aggTrade", "ethusdt@aggTrade"]
+        assert mock_connection.stream_callback_map["btcusdt@aggTrade"] == [callback]
+        assert mock_connection.stream_callback_map["ethusdt@aggTrade"] == [callback]
+        assert mock_registry.stream_connections_map["btcusdt@aggTrade"] is mock_connection
+        assert mock_registry.stream_connections_map["ethusdt@aggTrade"] is mock_connection
+
+    @pytest.mark.asyncio
     async def test_subscribe_adds_callback_to_existing_stream_without_resubscribe(
         self, websocket_stream, mock_connection, mock_registry
     ):
